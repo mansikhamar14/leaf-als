@@ -1,0 +1,16 @@
+# Audio files
+*.wav
+data/VOC-ALS/audio/
+
+# Models and logs
+*.pth
+*.log
+train_output.log
+
+# Python environment
+.venv/
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store

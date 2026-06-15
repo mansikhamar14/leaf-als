@@ -58,9 +58,11 @@ class AudioPreprocessor:
         return wav.astype(np.float32)
     
     def _resample(self, x, orig_sr, target_sr):
-        """Simple scipy resampling."""
-        num_samples = int(len(x) * target_sr / orig_sr)
-        return scipy.signal.resample(x, num_samples)
+        """Fast scipy resampling using polyphase filtering."""
+        gcd = math.gcd(orig_sr, target_sr)
+        up = target_sr // gcd
+        down = orig_sr // gcd
+        return scipy.signal.resample_poly(x, up, down)
     
     def normalize_length(self, wav):
         """Pad with zeros or truncate to fixed length."""
@@ -130,8 +132,9 @@ class GaborFilterbank(nn.Module):
         # In LEAF, bandwidth is learnable but initialized narrow
         sigma_init = 1.5 / f_init  # ~1.5 cycles at center freq
         
-        self.f = nn.Parameter(f_init)       # [n_filters]
-        self.sigma = nn.Parameter(sigma_init)  # [n_filters]
+        # Parameterize in log-space to ensure positivity and stable gradient scaling
+        self.log_f = nn.Parameter(torch.log(f_init))
+        self.log_sigma = nn.Parameter(torch.log(sigma_init))
         
         # Optional: initialize gains (per-filter amplitude)
         self.gain = nn.Parameter(torch.ones(n_filters))
@@ -139,18 +142,16 @@ class GaborFilterbank(nn.Module):
     def _build_filters(self):
         """
         Construct real and imaginary Gabor filters on every forward pass.
-        This allows gradients to flow back to f and sigma.
+        This allows gradients to flow back to log_f and log_sigma.
         """
         # Shape: [n_filters, 1, filter_len]
         t = self.t.unsqueeze(0)           # [1, filter_len]
-        f = self.f.unsqueeze(1)         # [n_filters, 1]
-        sigma = self.sigma.unsqueeze(1) # [n_filters, 1]
+        f = torch.exp(self.log_f).unsqueeze(1)         # [n_filters, 1]
+        sigma = torch.exp(self.log_sigma).unsqueeze(1) # [n_filters, 1]
         gain = self.gain.unsqueeze(1)   # [n_filters, 1]
         
         # Gaussian envelope: exp(-t^2 / (2*sigma^2))
-        # Clamp sigma to avoid numerical issues
-        sigma_clamped = torch.clamp(sigma, min=1e-4)
-        envelope = torch.exp(-0.5 * (t / sigma_clamped) ** 2)
+        envelope = torch.exp(-0.5 * (t / sigma) ** 2)
         
         # Normalize envelope to unit energy
         envelope = envelope / (envelope.sum(dim=1, keepdim=True) + 1e-8)
@@ -188,10 +189,11 @@ class LearnablePooling(nn.Module):
     Learnable Gaussian low-pass pooling (depthwise).
     Simulates the smoothing after envelope extraction.
     """
-    def __init__(self, n_filters=40, kernel_size=128):
+    def __init__(self, n_filters=40, kernel_size=128, stride=160):
         super().__init__()
         self.n_filters = n_filters
         self.kernel_size = kernel_size
+        self.stride = stride
         
         half = (kernel_size - 1) // 2
         self.register_buffer('t', torch.arange(-half, half + 1).float())
@@ -211,11 +213,12 @@ class LearnablePooling(nn.Module):
     def forward(self, x):
         """
         x: [batch, n_filters, time]
-        Returns: [batch, n_filters, time] (smoothed)
+        Returns: [batch, n_filters, time / stride] (smoothed and downsampled)
         """
         kernels = self._build_kernels()  # [n_filters, 1, kernel_size]
         # Depthwise conv1d: groups=n_filters
-        out = F.conv1d(x, kernels, padding='same', groups=self.n_filters)
+        half = (self.kernel_size - 1) // 2
+        out = F.conv1d(x, kernels, padding=half, stride=self.stride, groups=self.n_filters)
         return out
 
 
@@ -306,7 +309,7 @@ class LEAF(nn.Module):
             max_freq=max_freq
         )
         
-        self.pooling = LearnablePooling(n_filters=n_filters, kernel_size=pool_size)
+        self.pooling = LearnablePooling(n_filters=n_filters, kernel_size=pool_size, stride=160)
         self.pcen = PCENLayer(n_filters=n_filters)
     
     def forward(self, x):
@@ -326,9 +329,36 @@ class LEAF(nn.Module):
 # 3. CLASSIFIER (CNN ON LEAF FEATURES)
 # =============================================================================
 
+class ResNetBlock(nn.Module):
+    """
+    Standard residual block with 2D convolutions.
+    """
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+            
+    def forward(self, x):
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = self.relu(out)
+        return out
+
+
 class ALSClassifier(nn.Module):
     """
-    Simple but effective CNN classifier on top of LEAF features.
+    ResNet-style classifier on top of LEAF features.
     Input: LEAF spectrogram [batch, n_filters, time]
     Output: logits [batch, num_classes]
     """
@@ -336,32 +366,23 @@ class ALSClassifier(nn.Module):
         super().__init__()
         
         # Treat LEAF output as a 1-channel "image" [B, 1, n_filters, time]
-        self.conv = nn.Sequential(
-            # Block 1
-            nn.Conv2d(1, 32, kernel_size=(3, 7), padding=(1, 3)),
+        self.init_conv = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d((2, 4)),  # pool freq and time
-            nn.Dropout2d(dropout / 2),
-            
-            # Block 2
-            nn.Conv2d(32, 64, kernel_size=(3, 5), padding=(1, 2)),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d((2, 4)),
-            nn.Dropout2d(dropout / 2),
-            
-            # Block 3
-            nn.Conv2d(64, 128, kernel_size=(3, 3), padding=(1, 1)),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),  # Global average pooling
+            nn.ReLU(inplace=True)
         )
+        
+        self.layer1 = ResNetBlock(32, 32, stride=1)
+        self.layer2 = ResNetBlock(32, 64, stride=2)   # downsamples spatial dims by 2
+        self.layer3 = ResNetBlock(64, 128, stride=2)  # downsamples spatial dims by 2
+        self.layer4 = ResNetBlock(128, 256, stride=2) # downsamples spatial dims by 2
+        
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
         
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
+            nn.Linear(256, 64),
+            nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(64, num_classes)
         )
@@ -369,7 +390,12 @@ class ALSClassifier(nn.Module):
     def forward(self, leaf_features):
         # Add channel dimension: [B, 1, n_filters, time]
         x = leaf_features.unsqueeze(1)
-        x = self.conv(x)
+        x = self.init_conv(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.pool(x)
         x = self.classifier(x)
         return x
 
@@ -442,16 +468,18 @@ class VOCALSDataset(Dataset):
         return len(self.files)
     
     def __getitem__(self, idx):
-        if idx in self.cache and not self.augment:
-            return self.cache[idx]
+        if idx in self.cache:
+            wav = self.cache[idx]
+        else:
+            fname = self.files[idx]
+            fpath = os.path.join(self.audio_dir, fname)
+            
+            # Load and preprocess
+            wav = self.preprocessor.load_audio(fpath)
+            wav = self.preprocessor.normalize_length(wav)
+            self.cache[idx] = wav
         
-        fname = self.files[idx]
-        fpath = os.path.join(self.audio_dir, fname)
-        
-        # Load and preprocess
-        wav = self.preprocessor.load_audio(fpath)
-        wav = self.preprocessor.normalize_length(wav)
-        
+        # Apply augmentation if enabled
         if self.augment:
             wav = self.preprocessor.augment(wav)
         
@@ -459,11 +487,7 @@ class VOCALSDataset(Dataset):
         waveform = torch.from_numpy(wav).float().unsqueeze(0)  # [1, time]
         label = torch.tensor(self.labels[idx], dtype=torch.long)
         
-        item = (waveform, label)
-        if not self.augment:
-            self.cache[idx] = item
-        
-        return item
+        return waveform, label
 
 
 # =============================================================================
@@ -536,14 +560,14 @@ def evaluate(model, loader, device):
 def main():
     # Configuration
     CONFIG = {
-        'data_dir': './VOC-ALS',          # <-- CHANGE THIS
+        'data_dir': '/Users/mansikhamar/Desktop/College/Research/leaf-als/data/VOC-ALS',          # <-- CHANGE THIS
         'sr': 16000,
         'duration': 1.5,
         'n_filters': 40,                  # LEAF filterbank size
         'batch_size': 16,
         'lr': 1e-3,
-        'epochs': 50,
-        'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+        'epochs': 30,                     # Increased epochs for convergence
+        'device': 'mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu')
     }
     
     print(f"Using device: {CONFIG['device']}")
@@ -551,8 +575,22 @@ def main():
     # Preprocessor
     preprocessor = AudioPreprocessor(CONFIG['sr'], CONFIG['duration'])
     
-    # Load dataset
-    dataset = VOCALSDataset(
+    # Load separate dataset instances for train vs val/test to prevent leakage of augment = True
+    train_dataset = VOCALSDataset(
+        CONFIG['data_dir'],
+        sr=CONFIG['sr'],
+        duration=CONFIG['duration'],
+        augment=True,
+        preprocessor=preprocessor
+    )
+    val_dataset = VOCALSDataset(
+        CONFIG['data_dir'],
+        sr=CONFIG['sr'],
+        duration=CONFIG['duration'],
+        augment=False,
+        preprocessor=preprocessor
+    )
+    test_dataset = VOCALSDataset(
         CONFIG['data_dir'],
         sr=CONFIG['sr'],
         duration=CONFIG['duration'],
@@ -561,8 +599,8 @@ def main():
     )
     
     # Train/val/test split (stratified)
-    indices = np.arange(len(dataset))
-    labels = dataset.labels
+    indices = np.arange(len(train_dataset))
+    labels = train_dataset.labels
     
     # First: train+val vs test (80/20)
     trainval_idx, test_idx = train_test_split(
@@ -575,13 +613,10 @@ def main():
         stratify=labels[trainval_idx], random_state=42
     )
     
-    # Create subsets
-    train_dataset = torch.utils.data.Subset(dataset, train_idx)
-    val_dataset = torch.utils.data.Subset(dataset, val_idx)
-    test_dataset = torch.utils.data.Subset(dataset, test_idx)
-    
-    # Enable augmentation only for training
-    train_dataset.dataset.augment = True
+    # Create subsets using the correct instances
+    train_dataset = torch.utils.data.Subset(train_dataset, train_idx)
+    val_dataset = torch.utils.data.Subset(val_dataset, val_idx)
+    test_dataset = torch.utils.data.Subset(test_dataset, test_idx)
     
     train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'], 
                               shuffle=True, num_workers=0)
@@ -604,12 +639,23 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total params: {total_params:,}, Trainable: {trainable_params:,}")
     
-    # Optimizer and scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG['lr'], weight_decay=1e-4)
+    # Split optimizer learning rates: lower learning rate for the sensitive LEAF frontend
+    optimizer = torch.optim.AdamW([
+        {'params': model.leaf.parameters(), 'lr': CONFIG['lr'] * 0.1},
+        {'params': model.classifier.parameters(), 'lr': CONFIG['lr']}
+    ], weight_decay=1e-4)
+    
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5, verbose=True
+        optimizer, mode='max', factor=0.5, patience=5
     )
-    criterion = nn.CrossEntropyLoss()
+    
+    # Calculate class weights dynamically from training labels to handle class imbalance
+    train_labels = labels[train_idx]
+    class_counts = np.bincount(train_labels)
+    class_weights = len(train_labels) / (len(class_counts) * class_counts)
+    class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(CONFIG['device'])
+    
+    criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
     
     # Training
     best_val_f1 = 0.0
@@ -647,8 +693,8 @@ def main():
     print("\n" + "="*60)
     print("LEARNED LEAF PARAMETERS (Sample)")
     print("="*60)
-    print(f"Center frequencies (first 5): {model.leaf.gabor.f[:5].detach().cpu().numpy()}")
-    print(f"Bandwidths (first 5): {model.leaf.gabor.sigma[:5].detach().cpu().numpy()}")
+    print(f"Center frequencies (first 5): {torch.exp(model.leaf.gabor.log_f[:5]).detach().cpu().numpy()}")
+    print(f"Bandwidths (first 5): {torch.exp(model.leaf.gabor.log_sigma[:5]).detach().cpu().numpy()}")
     print(f"PCEN s (first 5): {model.leaf.pcen.s[:5].detach().cpu().numpy()}")
     print(f"PCEN alpha (first 5): {model.leaf.pcen.alpha[:5].detach().cpu().numpy()}")
     
